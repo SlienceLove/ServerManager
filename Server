@@ -1,0 +1,710 @@
+using UnityEngine;
+using System.Net;
+using System.Net.Sockets;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.IO;
+using System.Linq; // 用于 .ToArray()
+using System; // 用于 Math.Min, Enum
+using System.Collections.Generic;
+using Tools; // 用于 StringBuilder, List
+using Newtonsoft.Json;
+using Question; // 确保引入 Newtonsoft.Json
+
+public class SimpleTcpLoginServer : MonoBehaviour
+{
+    private TcpListener tcpListener;
+    private Thread listenThread;
+    private const int PORT = 13400;
+    private bool isRunning = false;
+
+    // 服务器存储上传文件和提供下载的唯一根目录
+    private string serverDataRootPath;
+    private UserManager userManager; // 用户管理器
+    private QuizManager quizManager; // 新增: QuizManager 实例
+    void Start()
+    {
+        // 初始化服务器数据根路径
+        serverDataRootPath = Path.Combine(Application.persistentDataPath, "A_Product", "Server");
+        if (!Directory.Exists(serverDataRootPath))
+        {
+            Directory.CreateDirectory(serverDataRootPath);
+            Debug.Log($"Server: Created data directory: {serverDataRootPath}");
+        }
+        else
+        {
+            Debug.Log($"Server: Data directory already exists: {serverDataRootPath}");
+        }
+
+        userManager = new UserManager(serverDataRootPath); // 初始化用户管理器
+        quizManager = new QuizManager(serverDataRootPath);
+        StartServer();
+    }
+
+    void StartServer()
+    {
+        try
+        {
+            tcpListener = new TcpListener(IPAddress.Any, PORT);
+            tcpListener.Start();
+            isRunning = true;
+            Debug.Log($"Server: Simple TCP Server started on port {PORT}. Waiting for connections...");
+
+            listenThread = new Thread(new ThreadStart(ListenForClients));
+            listenThread.IsBackground = true;
+            listenThread.Start();
+        }
+        catch (SocketException socketException)
+        {
+            Debug.LogError($"Server: SocketException: {socketException.Message}");
+        }
+    }
+
+    private async void ListenForClients()
+    {
+        while (isRunning)
+        {
+            try
+            {
+                TcpClient client = await tcpListener.AcceptTcpClientAsync();
+                Debug.Log("Server: Client connected!");
+                HandleClientComm(client);
+            }
+            catch (SocketException)
+            {
+                if (!isRunning) Debug.Log("Server: Server stopped listening.");
+                else Debug.LogError("Server: Error accepting client connection.");
+            }
+            catch (System.ObjectDisposedException)
+            {
+                if (!isRunning) Debug.Log("Server: TcpListener was disposed.");
+            }
+        }
+    }
+
+
+   private async void HandleClientComm(TcpClient client)
+    {
+        Debug.Log("Server: Handling new client connection.");
+        NetworkStream clientStream = client.GetStream();
+        byte[] messageBuffer = new byte[8192]; // 通用读取缓冲区
+        MemoryStream dataBuffer = new MemoryStream(); // !!! 修正：在这里定义 dataBuffer !!!
+
+        User loggedInUser = null;
+
+        try
+        {
+            while (client.Connected)
+            {
+                // !!! 修正：直接使用 ReadNextLineFromStream 读取命令头 !!!
+                string fullHeader = await ReadNextLineFromStream(clientStream, dataBuffer, messageBuffer);
+
+                if (string.IsNullOrEmpty(fullHeader))
+                {
+                    Debug.Log("Server: Client sent empty line or disconnected.");
+                    break;
+                }
+
+                Debug.Log($"Server Debug: Received command: '{fullHeader}'");
+
+                // --- 登录处理 ---
+                if (fullHeader.StartsWith("login:"))
+                {
+                    string[] parts = fullHeader.Split(':');
+                    if (parts.Length == 3)
+                    {
+                        string username = parts[1];
+                        string password = parts[2];
+                        loggedInUser = userManager.AuthenticateUser(username, password);
+                        if (loggedInUser != null)
+                        {
+                            string responseMessage = $"LOGIN_SUCCESS:{loggedInUser.Username}:{loggedInUser.UserType}:{loggedInUser.Id}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.Log($"Server: User '{loggedInUser.Username}' logged in successfully as {loggedInUser.UserType}.");
+                        }
+                        else
+                        {
+                            string responseMessage = "LOGIN_FAILED:Invalid username or password.\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogWarning($"Server: Failed login attempt for user '{username}'.");
+                        }
+                    }
+                    else
+                    {
+                        string responseMessage = "LOGIN_FAILED:Invalid login request format.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        Debug.LogWarning($"Server: Received malformed login request: '{fullHeader}'");
+                    }
+                }
+                // --- 注册用户命令 (仅限管理员) ---
+                // else if (fullHeader.StartsWith("REGISTER_USER:"))
+                // {
+                //     if (loggedInUser == null || loggedInUser.UserType != UserType.Admin)
+                //     {
+                //         string responseMessage = "ERROR:Unauthorized. Only administrators can register new users.\n";
+                //         await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                //     }
+                //     else
+                //     {
+                //         string[] parts = fullHeader.Split(':');
+                //         if (parts.Length == 4) // REGISTER_USER:new_username:new_password:user_type
+                //         {
+                //             string newUsername = parts[1];
+                //             string newPassword = parts[2];
+                //             UserType newUserType;
+                //             if (Enum.TryParse(parts[3], out newUserType))
+                //             {
+                //                 if (userManager.AddUser(newUsername, newPassword, newUserType))
+                //                 {
+                //                     string responseMessage = $"REGISTER_SUCCESS:{newUsername}:{newUserType}\n";
+                //                     await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                //                     Debug.Log($"Server: Admin '{loggedInUser.Username}' successfully registered new user '{newUsername}' as {newUserType}.");
+                //                 }
+                //                 else
+                //                 {
+                //                     string responseMessage = $"REGISTER_FAILED:User '{newUsername}' already exists.\n";
+                //                     await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                //                     Debug.LogWarning($"Server: Admin '{loggedInUser.Username}' failed to register user '{newUsername}': already exists.");
+                //                 }
+                //             }
+                //             else
+                //             {
+                //                 string responseMessage = "REGISTER_FAILED:Invalid user type. Expected 'Client' or 'Admin'.\n";
+                //                 await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                //                 Debug.LogWarning($"Server: Invalid user type provided during registration by '{loggedInUser.Username}'.");
+                //             }
+                //         }
+                //         else
+                //         {
+                //             string responseMessage = "REGISTER_FAILED:Invalid register user format. Expected: REGISTER_USER:username:password:usertype\n";
+                //             await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                //             Debug.LogWarning($"Server: Invalid register user request format by '{loggedInUser.Username}'.");
+                //         }
+                //     }
+                // }
+                // --- 其他命令需要先登录 ---
+                else if (loggedInUser == null)
+                {
+                    string responseMessage = "ERROR:Authentication required. Please login first.\n";
+                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                    Debug.LogWarning($"Server: Rejected command '{fullHeader.Split(':')[0]}' from unauthenticated client.");
+                }
+                // --- 文件传输命令 (现有) ---
+                else if (fullHeader.StartsWith("GET_ALL_SERVER_FILES"))
+                {
+                    Debug.Log($"Server: Client requested all server files for synchronization by '{loggedInUser.Username}'.");
+                    string startMessage = "START_FOLDER_TRANSFER\n";
+                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(startMessage), 0, Encoding.UTF8.GetByteCount(startMessage));
+
+                    string[] allFiles = Directory.EnumerateFiles(serverDataRootPath, "*", SearchOption.AllDirectories).ToArray();
+                    Debug.Log($"Server: Found {allFiles.Length} files in '{serverDataRootPath}' to send.");
+
+                    foreach (string filePath in allFiles)
+                    {
+                        string relativePath = Path.GetRelativePath(serverDataRootPath, filePath).Replace('\\', '/');
+                        FileInfo fileInfo = new FileInfo(filePath);
+                        long fileSize = fileInfo.Length;
+
+                        string fileInfoMessage = $"FILE_INFO:{relativePath}:{fileSize}\n";
+                        byte[] infoBytes = Encoding.UTF8.GetBytes(fileInfoMessage);
+                        await clientStream.WriteAsync(infoBytes, 0, infoBytes.Length);
+                        Debug.Log($"Server: Sending file entry: '{relativePath}' ({fileSize} bytes)");
+
+                        using (FileStream fileStream = new FileStream(filePath, FileMode.Open, FileAccess.Read))
+                        {
+                            byte[] buffer = new byte[8192];
+                            int bytesSent;
+                            long totalBytesSent = 0;
+                            while ((bytesSent = await fileStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                            {
+                                await clientStream.WriteAsync(buffer, 0, bytesSent);
+                                totalBytesSent += bytesSent;
+                            }
+                            Debug.Log($"Server: Sent '{relativePath}' content. Total: {totalBytesSent} bytes.");
+                        }
+                        byte[] contentEndDelimiter = Encoding.UTF8.GetBytes("\n");
+                        await clientStream.WriteAsync(contentEndDelimiter, 0, contentEndDelimiter.Length);
+                        Debug.Log($"Server: Sent content end delimiter for '{relativePath}'.");
+                    }
+
+                    string endMessage = "END_FOLDER_TRANSFER\n";
+                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(endMessage), 0, Encoding.UTF8.GetByteCount(endMessage));
+                    Debug.Log("Server: Finished sending all server files.");
+                }
+                else if (fullHeader.StartsWith("UPLOAD_FILE:"))
+                {
+                    string[] parts = fullHeader.Split(':');
+                    if (parts.Length >= 3)
+                    {
+                        string uploadedFileName = parts[1];
+                        long fileSize = long.Parse(parts[2]);
+                        string subpath = (parts.Length >= 4) ? SanitizeSubpath(parts[3]) : "";
+
+                        string targetDirectory = Path.Combine(serverDataRootPath, subpath);
+                        string savePath = Path.Combine(targetDirectory, uploadedFileName);
+
+                        Debug.Log($"Server: Receiving file '{uploadedFileName}' ({fileSize} bytes) to '{savePath}' (subpath: '{subpath}')...");
+
+                        try
+                        {
+                            if (!Directory.Exists(targetDirectory))
+                            {
+                                Directory.CreateDirectory(targetDirectory);
+                            }
+
+                            using (FileStream fileStream = new FileStream(savePath, FileMode.Create, FileAccess.Write))
+                            {
+                                long totalBytesReceived = 0;
+
+                                // !!! 修正：从 dataBuffer 中消费数据，并更新 dataBuffer !!!
+                                if (dataBuffer.Length > 0)
+                                {
+                                    long bytesToConsume = Math.Min(dataBuffer.Length, fileSize);
+                                    byte[] tempBuffer = new byte[(int)bytesToConsume];
+                                    dataBuffer.Position = 0;
+                                    dataBuffer.Read(tempBuffer, 0, (int)bytesToConsume);
+                                    await fileStream.WriteAsync(tempBuffer, 0, tempBuffer.Length);
+                                    totalBytesReceived += bytesToConsume;
+
+                                    // 移动 dataBuffer 中剩余的数据到开头
+                                    MemoryStream tempRemainingBuffer = new MemoryStream();
+                                    if (dataBuffer.Position < dataBuffer.Length)
+                                    {
+                                        dataBuffer.CopyTo(tempRemainingBuffer);
+                                    }
+                                    dataBuffer.SetLength(0);
+                                    dataBuffer.Position = 0;
+                                    tempRemainingBuffer.Position = 0;
+                                    tempRemainingBuffer.CopyTo(dataBuffer);
+                                    dataBuffer.Position = 0;
+                                    tempRemainingBuffer.Dispose();
+                                }
+
+                                while (totalBytesReceived < fileSize)
+                                {
+                                    int bytesToRead = (int)Math.Min(messageBuffer.Length, fileSize - totalBytesReceived);
+                                    int currentBytesRead = await clientStream.ReadAsync(messageBuffer, 0, bytesToRead);
+                                    if (currentBytesRead == 0)
+                                    {
+                                        Debug.LogError("Server: Client closed connection prematurely during file upload.");
+                                        break;
+                                    }
+                                    await fileStream.WriteAsync(messageBuffer, 0, currentBytesRead);
+                                    totalBytesReceived += currentBytesRead;
+                                }
+
+                                if (totalBytesReceived == fileSize)
+                                {
+                                    string successMessage = $"UPLOAD_SUCCESS:{uploadedFileName}\n";
+                                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(successMessage), 0, Encoding.UTF8.GetByteCount(successMessage));
+                                    Debug.Log($"Server: File '{uploadedFileName}' uploaded successfully. Total: {totalBytesReceived} bytes.");
+                                }
+                                else
+                                {
+                                    string errorMessage = $"UPLOAD_ERROR:Incomplete file upload for '{uploadedFileName}'. Expected {fileSize}, received {totalBytesReceived}.\n";
+                                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(errorMessage), 0, Encoding.UTF8.GetByteCount(errorMessage));
+                                    Debug.LogError(errorMessage.Trim());
+                                }
+                            }
+                        }
+                        catch (System.Exception ex)
+                        {
+                            string errorMessage = $"UPLOAD_ERROR:Server failed to save file '{uploadedFileName}'. Error: {ex.Message}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(errorMessage), 0, Encoding.UTF8.GetByteCount(errorMessage));
+                            Debug.LogError(errorMessage.Trim());
+                        }
+                    }
+                    else
+                    {
+                        string errorMessage = "ERROR:Invalid UPLOAD_FILE request format. Expected: UPLOAD_FILE:filename:filesize[:subpath]\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(errorMessage), 0, Encoding.UTF8.GetByteCount(errorMessage));
+                    }
+                }
+                
+                // --- 新增: 超级管理员导入用户命令 ---
+                else if (fullHeader.StartsWith("ADMIN_IMPORT_USERS:"))
+                {
+                    if (loggedInUser.UserType != UserType.SuperAdmin)
+                    {
+                        string responseMessage = "ERROR:Unauthorized. Only SuperAdmins can import users.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        continue;
+                    }
+
+                    string[] parts = fullHeader.Split(':');
+                    // 期望格式: ADMIN_IMPORT_USERS:user_type:json_length
+                    if (parts.Length == 3 && Enum.TryParse(parts[1], out UserType targetUserType) && long.TryParse(parts[2], out long jsonLength))
+                    {
+                        Debug.Log($"Server: SuperAdmin '{loggedInUser.Username}' is importing {targetUserType} users. JSON payload length: {jsonLength} bytes.");
+                        try
+                        {
+                            byte[] jsonBytes = await ReadExactBytesFromStream(clientStream, dataBuffer, messageBuffer, jsonLength);
+                            string jsonPayload = Encoding.UTF8.GetString(jsonBytes);
+                            
+                            List<User> importedUsers = JsonConvert.DeserializeObject<List<User>>(jsonPayload);
+                            if (importedUsers != null && importedUsers.Any())
+                            {
+                                var result = userManager.ImportUsers(importedUsers, targetUserType);
+                                string responseMessage = $"IMPORT_USERS_SUCCESS:Added {result.added}, Updated {result.updated}, Failed {result.failed}\n";
+                                await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                                Debug.Log($"Server: SuperAdmin '{loggedInUser.Username}' successfully imported {importedUsers.Count} users of type {targetUserType}.");
+                            }
+                            else
+                            {
+                                string responseMessage = "IMPORT_USERS_FAILED:No users found in payload or invalid data.\n";
+                                await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                                Debug.LogWarning($"Server: SuperAdmin '{loggedInUser.Username}' failed to import users. JSON: {jsonPayload}");
+                            }
+                        }
+                        catch (JsonException jex)
+                        {
+                            string responseMessage = $"IMPORT_USERS_FAILED:Invalid JSON format. Error: {jex.Message}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogError($"Server: JSON deserialization error for ADMIN_IMPORT_USERS: {jex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            string responseMessage = $"IMPORT_USERS_FAILED:Server error: {ex.Message}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogError($"Server: Error processing ADMIN_IMPORT_USERS: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        string responseMessage = "ERROR:Invalid ADMIN_IMPORT_USERS format. Expected: ADMIN_IMPORT_USERS:user_type:json_length\n{json_payload}\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                    }
+                }
+                
+                // --- 新增: 答题系统管理命令 ---
+                // 管理员添加题目
+                else if (fullHeader.StartsWith("ADMIN_ADD_QUESTION:"))
+                {
+                    if (loggedInUser.UserType != UserType.Teacher)
+                    {
+                        string responseMessage = "ERROR:Unauthorized. Only administrators can add questions.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        continue; // 继续等待下一个命令
+                    }
+
+                    string[] parts = fullHeader.Split(':');
+                    // 期望格式: ADMIN_ADD_QUESTION:json_length
+                    if (parts.Length == 2 && long.TryParse(parts[1], out long jsonLength))
+                    {
+                        Debug.Log($"Server: Admin '{loggedInUser.Username}' is adding a question. JSON payload length: {jsonLength} bytes.");
+                        try
+                        {
+                            // !!! 修正：传递 dataBuffer !!!
+                            byte[] jsonBytes = await ReadExactBytesFromStream(clientStream, dataBuffer, messageBuffer, jsonLength);
+                            string jsonPayload = Encoding.UTF8.GetString(jsonBytes);
+                            
+                            Question.Question newQuestion = JsonSerializationHelper.DeserializeObject<Question.Question>(jsonPayload); 
+                            if (newQuestion != null && quizManager.AddQuestion(newQuestion))
+                            {
+                                string responseMessage = $"ADD_QUESTION_SUCCESS:{newQuestion.Id}\n";
+                                await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                                Debug.Log($"Server: Admin '{loggedInUser.Username}' successfully added question '{newQuestion.Id}'.");
+                            }
+                            else
+                            {
+                                string responseMessage = "ADD_QUESTION_FAILED:Failed to add question (ID might exist or invalid data).\n";
+                                await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                                Debug.LogWarning($"Server: Admin '{loggedInUser.Username}' failed to add question. JSON: {jsonPayload}");
+                            }
+                        }
+                        catch (JsonException jex)
+                        {
+                            string responseMessage = $"ADD_QUESTION_FAILED:Invalid JSON format. Error: {jex.Message}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogError($"Server: JSON deserialization error for ADMIN_ADD_QUESTION: {jex.Message}");
+                        }
+                        catch (Exception ex)
+                        {
+                            string responseMessage = $"ADD_QUESTION_FAILED:Server error: {ex.Message}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogError($"Server: Error processing ADMIN_ADD_QUESTION: {ex.Message}");
+                        }
+                    }
+                    else
+                    {
+                        string responseMessage = "ERROR:Invalid ADMIN_ADD_QUESTION format. Expected: ADMIN_ADD_QUESTION:json_length\n{json_payload}\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                    }
+                }
+                // 管理员删除题目
+                else if (fullHeader.StartsWith("ADMIN_DELETE_QUESTION:"))
+                {
+                    if (loggedInUser.UserType != UserType.Teacher)
+                    {
+                        string responseMessage = "ERROR:Unauthorized. Only administrators can delete questions.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        continue;
+                    }
+
+                    string[] parts = fullHeader.Split(':');
+                    // 期望格式: ADMIN_DELETE_QUESTION:question_id
+                    if (parts.Length == 2)
+                    {
+                        string questionId = parts[1];
+                        if (quizManager.DeleteQuestion(questionId))
+                        {
+                            string responseMessage = $"DELETE_QUESTION_SUCCESS:{questionId}\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.Log($"Server: Admin '{loggedInUser.Username}' successfully deleted question '{questionId}'.");
+                        }
+                        else
+                        {
+                            string responseMessage = $"DELETE_QUESTION_FAILED:Question '{questionId}' not found or failed to delete.\n";
+                            await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                            Debug.LogWarning($"Server: Admin '{loggedInUser.Username}' failed to delete question '{questionId}'.");
+                        }
+                    }
+                    else
+                    {
+                        string responseMessage = "ERROR:Invalid ADMIN_DELETE_QUESTION format. Expected: ADMIN_DELETE_QUESTION:question_id\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                    }
+                }
+                // 管理员获取所有题目
+                else if (fullHeader.StartsWith("ADMIN_GET_ALL_QUESTIONS"))
+                {
+                    if (loggedInUser.UserType != UserType.Teacher)
+                    {
+                        string responseMessage = "ERROR:Unauthorized. Only administrators can retrieve all questions.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        continue;
+                    }
+
+                    try
+                    {
+                        string jsonQuestionBank = JsonSerializationHelper.SerializeObject(quizManager.QuestionBank);
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonQuestionBank);
+                        string responseHeader = $"QUESTION_BANK_DATA:{jsonBytes.Length}\n"; // 告知客户端 JSON 负载的长度
+                        
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseHeader), 0, Encoding.UTF8.GetByteCount(responseHeader));
+                        await clientStream.WriteAsync(jsonBytes, 0, jsonBytes.Length);
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes("\n"), 0, 1); // 额外发送一个换行符作为 JSON 负载的结束分隔符
+                        Debug.Log($"Server: Admin '{loggedInUser.Username}' retrieved all questions. Sent {jsonBytes.Length} bytes.");
+                    }
+                    catch (Exception ex)
+                    {
+                        string responseMessage = $"ERROR:Failed to retrieve question bank: {ex.Message}\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        Debug.LogError($"Server: Error sending question bank to admin: {ex.Message}");
+                    }
+                }
+                
+                
+                
+                // --- 普通用户获取所有测验列表 (新增) ---
+                else if (fullHeader.StartsWith("GET_AVAILABLE_QUIZZES"))
+                {
+                    // 任何登录用户都可以获取测验列表
+                    if (loggedInUser == null)
+                    {
+                        string responseMessage = "ERROR:Authentication required to get quizzes.\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        continue;
+                    }
+
+                    try
+                    {
+                        string jsonQuizzes = JsonSerializationHelper.SerializeObject(quizManager.Quizzes);
+                        byte[] jsonBytes = Encoding.UTF8.GetBytes(jsonQuizzes);
+                        string responseHeader = $"QUIZ_LIST_DATA:{jsonBytes.Length}\n";
+                        
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseHeader), 0, Encoding.UTF8.GetByteCount(responseHeader));
+                        await clientStream.WriteAsync(jsonBytes, 0, jsonBytes.Length);
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes("\n"), 0, 1); // 额外发送一个换行符作为 JSON 负载的结束分隔符
+                        Debug.Log($"Server: User '{loggedInUser.Username}' retrieved all quizzes. Sent {jsonBytes.Length} bytes.");
+                    }
+                    catch (Exception ex)
+                    {
+                        string responseMessage = $"ERROR:Failed to retrieve quiz list: {ex.Message}\n";
+                        await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                        Debug.LogError($"Server: Error sending quiz list to user: {ex.Message}");
+                    }
+                }
+                // --- 通用错误处理 ---
+                else
+                {
+                    Debug.Log($"Server: Unrecognized command from '{loggedInUser?.Username ?? "unauthenticated"}': '{fullHeader}'");
+                    string responseMessage = "ERROR:Unrecognized command.\n";
+                    await clientStream.WriteAsync(Encoding.UTF8.GetBytes(responseMessage), 0, Encoding.UTF8.GetByteCount(responseMessage));
+                }
+            }
+        }
+        catch (EndOfStreamException eose)
+        {
+            Debug.LogWarning($"Server: Client disconnected unexpectedly: {eose.Message}");
+        }
+        catch (Exception ex)
+        {
+            Debug.LogError($"Server: Error handling client '{loggedInUser?.Username ?? "unauthenticated"}': {ex.Message}");
+        }
+        finally
+        {
+            client.Close();
+            Debug.Log($"Server: Client '{loggedInUser?.Username ?? "unauthenticated"}' disconnected.");
+        }
+    }
+
+
+    void OnApplicationQuit()
+    {
+        StopServer();
+    }
+
+    void OnDestroy()
+    {
+        StopServer();
+    }
+
+    void StopServer()
+    {
+        if (isRunning)
+        {
+            isRunning = false;
+            if (tcpListener != null)
+            {
+                tcpListener.Stop();
+                Debug.Log("Server: Simple TCP Server stopped.");
+            }
+            if (listenThread != null && listenThread.IsAlive)
+            {
+                listenThread.Join();
+            }
+        }
+    }
+
+
+
+    #region 题库新增Json
+
+     // 新增：一个用于清理路径的辅助方法，防止目录遍历攻击
+    private string SanitizeSubpath(string subpath)
+    {
+        if (string.IsNullOrWhiteSpace(subpath))
+        {
+            return "";
+        }
+
+        subpath = subpath.Replace('/', Path.DirectorySeparatorChar).Replace('\\', Path.DirectorySeparatorChar);
+        string[] segments = subpath.Split(Path.DirectorySeparatorChar, StringSplitOptions.RemoveEmptyEntries);
+        var sanitizedSegments = new System.Collections.Generic.List<string>();
+        foreach (var segment in segments)
+        {
+            if (segment == "..")
+            {
+                continue;
+            }
+            string cleanSegment = string.Join("_", segment.Split(Path.GetInvalidFileNameChars()));
+            sanitizedSegments.Add(cleanSegment);
+        }
+
+        return string.Join(Path.DirectorySeparatorChar.ToString(), sanitizedSegments);
+    }
+
+    // 新增：服务器端读取下一行文本的辅助方法
+    private async Task<string> ReadNextLineFromStream(NetworkStream networkStream, MemoryStream dataBuffer, byte[] readBuffer)
+    {
+        while (true)
+        {
+            byte[] buffer = dataBuffer.GetBuffer();
+            int currentLength = (int)dataBuffer.Length;
+
+            int newlineIndex = -1;
+            for (int i = 0; i < currentLength; i++)
+            {
+                if (buffer[i] == (byte)'\n')
+                {
+                    newlineIndex = i;
+                    break;
+                }
+            }
+
+            if (newlineIndex >= 0)
+            {
+                string line = Encoding.UTF8.GetString(buffer, 0, newlineIndex).Trim();
+                
+                int bytesToShift = currentLength - (newlineIndex + 1);
+                if (bytesToShift > 0)
+                {
+                    Buffer.BlockCopy(buffer, newlineIndex + 1, buffer, 0, bytesToShift);
+                }
+                dataBuffer.SetLength(bytesToShift);
+                dataBuffer.Position = 0;
+
+                return line;
+            }
+
+            if (dataBuffer.Capacity - dataBuffer.Length < readBuffer.Length)
+            {
+                dataBuffer.Capacity = (int)(dataBuffer.Length + readBuffer.Length * 2); 
+            }
+
+            int bytesRead = await networkStream.ReadAsync(readBuffer, 0, readBuffer.Length);
+            if (bytesRead == 0)
+            {
+                if (dataBuffer.Length > 0)
+                {
+                    string remaining = Encoding.UTF8.GetString(buffer, 0, currentLength).Trim();
+                    dataBuffer.SetLength(0);
+                    dataBuffer.Position = 0;
+                    return remaining;
+                }
+                throw new EndOfStreamException("Server: Network stream ended unexpectedly.");
+            }
+            dataBuffer.Position = dataBuffer.Length; 
+            dataBuffer.Write(readBuffer, 0, bytesRead);
+        }
+    }
+
+    // 新增：服务器端读取精确字节数的辅助方法 (用于 JSON 负载)
+    private async Task<byte[]> ReadExactBytesFromStream(NetworkStream networkStream, MemoryStream dataBuffer, byte[] readBuffer, long bytesToRead)
+    {
+        MemoryStream resultBuffer = new MemoryStream();
+        long totalBytesRead = 0;
+
+        // 首先，从 dataBuffer 中消费数据
+        if (dataBuffer.Length > 0)
+        {
+            long bytesFromDataBuffer = Math.Min(dataBuffer.Length, bytesToRead - totalBytesRead);
+            if (bytesFromDataBuffer > 0)
+            {
+                byte[] temp = new byte[(int)bytesFromDataBuffer];
+                dataBuffer.Position = 0;
+                dataBuffer.Read(temp, 0, (int)bytesFromDataBuffer);
+                await resultBuffer.WriteAsync(temp, 0, temp.Length);
+                totalBytesRead += bytesFromDataBuffer;
+
+                // 移动 dataBuffer 中剩余的数据到开头
+                byte[] remainingData = dataBuffer.ToArray(); // 获取从当前 Position 到 Length 的所有数据
+                dataBuffer.SetLength(0);
+                dataBuffer.Position = 0;
+                dataBuffer.Write(remainingData, 0, remainingData.Length);
+                dataBuffer.Position = 0;
+            }
+        }
+
+        // 然后，从网络流中读取剩余数据
+        while (totalBytesRead < bytesToRead)
+        {
+            int currentReadSize = (int)Math.Min(readBuffer.Length, bytesToRead - totalBytesRead);
+            int bytesJustRead = await networkStream.ReadAsync(readBuffer, 0, currentReadSize);
+            if (bytesJustRead == 0)
+            {
+                throw new EndOfStreamException($"Server: Network stream ended prematurely while reading {bytesToRead} bytes. Read {totalBytesRead}.");
+            }
+            await resultBuffer.WriteAsync(readBuffer, 0, bytesJustRead);
+            totalBytesRead += bytesJustRead;
+        }
+
+        return resultBuffer.ToArray();
+    }
+
+
+
+    #endregion
+}
